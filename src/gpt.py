@@ -14,6 +14,16 @@ class EmbeddingLayer:
         return self.embeddings[inputs]
 
 
-embedding = EmbeddingLayer(10, 5)
-inputs = np.array([6, 9, 3, 2, 7])
-print(embedding.forward(inputs))
+class Softmax:
+    def __init__(self):
+        self.softmax_out = None
+
+    def forward(self, inputs):
+        max_logit = np.max(inputs, axis=1, keepdims=True)
+
+        softmax_out = np.exp(inputs - max_logit) / np.sum(
+            np.exp(input - max_logit), axis=1, keepdims=true
+        )
+        self.softmax_out = softmax_out
+
+        return softmax_out
