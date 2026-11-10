@@ -14,6 +14,30 @@ class EmbeddingLayer:
         return self.embeddings[inputs]
 
 
+class PositionalEncodings:
+    def __init__(self, embedding_dim):
+        self.embedding_dim = embedding_dim
+
+    def forward(self, inputs):
+        B, T, D = inputs.shape
+
+        pos = np.arange(T)[:, np.newaxis]
+        denominator = (np.arange(D) // 2 * 2) / D
+        denominator = 1 / (10000**denominator)
+        denominator = denominator[np.newaxis, :]
+
+        inner = pos * denominator
+        pe_sin = np.sin(inner)
+        pe_cos = np.cos(inner)
+
+        pe_sin[:, 1::2] = 0
+        pe_cos[:, 0::2] = 0
+
+        positional_encodings = pe_sin + pe_cos
+
+        return inputs + positional_endcodings[np.newaxis, ...]
+
+
 class Softmax:
     def __init__(self):
         self.softmax_out = None
@@ -240,7 +264,7 @@ class GPT:
 
         # Decoder
         self.embedding_layer = EmbeddingLayer(vocab_size, embedding_dim=d_model)
-        # self.positional_encodings_decoder = PositionalEncodings(d_model)
+        self.positional_encodings_decoder = PositionalEncodings(d_model)
         res_weight_init_scale = (2 * blocks) ** (-0.5)
         self.decoder_blocks = [
             TransformerBlock(d_model, n_heads, ln_position, res_weight_init_scale)
@@ -254,7 +278,7 @@ class GPT:
     def forward(self, input_tokens_decoder, mask_attention=None, padding_mask=None):
         # Decoder forward
         out_d = self.embedding_layer.forward(input_tokens_decoder)
-        # out_d = self.positional_encodings_decoder.forward(out_d)
+        out_d = self.positional_encodings_decoder.forward(out_d)
 
         for decoder in self.decoder_blocks:
             out_d = decoder.forward(
