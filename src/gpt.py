@@ -61,21 +61,20 @@ class CrossEntropyLossWithSoftmax:
 
 
 class Linear:
-    def __init__(self, dim_in, dim_out, include_bias=True):
-        self.W = np.random.randn(dim_in, dim_out) * 0.02
-
+    def __init__(self, input_units, output_units, include_bias=True):
+        self.weights = np.random.randn(input_units, output_units) * 0.02
         if include_bias:
-            self.b = np.zeros(dim_out)
-        else:
-            self.b = None
+            self.bias = np.zeros((1, output_units))
+            self.grad_bias = np.zeros(self.bias.shape)
+        self.inputs = None
+        self.include_bias = include_bias
 
     def forward(self, inputs):
-        output = inputs @ self.W
-
-        if self.b is not None:
-            output = output + self.b
-
-        return output
+        self.inputs = inputs
+        if self.include_bias:
+            return inputs @ self.weights + self.bias
+        else:
+            return inputs @ self.weights
 
 
 class MultiHeadAttention:
@@ -155,3 +154,81 @@ class MultiHeadAttention:
         self.attention_weights = attention_weights
 
         return final_vector
+
+
+class LayerNormalization:
+    def __init__(self, input_dim):
+        self.input_dim = input_dim
+        self.gain = np.ones((1, input_dim))
+        self.bias = np.zeros((1, input_dim))
+
+        self.mean = None
+        self.mu = None
+        self.var = None
+        self.std = None
+        self.out = None
+
+        self.grad_gain = np.zeros(self.gain.shape)
+        self.grad_bias = np.zeros(self.bias.shape)
+
+    def forward(self, inputs):
+        epsilon = 1e-5
+
+        self.mean = (1 / self.input_dim) * np.sum(inputs, axis=-1, keepdims=True)
+        self.mu = inputs - self.mean
+        self.var = (1 / self.input_dim) * np.sum(
+            np.square(self.mu), axis=-1, keepdims=True
+        )
+        self.std = np.sqrt(self.var + epsilon)
+        self.out = self.gain * (self.mu / self.std) + self.bias
+
+        return self.out
+
+
+class ReLU:
+    def __init__(self):
+        self.inputs = None
+
+    def forward(self, inputs):
+        self.inputs = inputs
+        return np.maximum(0, inputs)
+
+
+class FeedForwardNetwork:
+    def __init__(self, input_units, hidden_units, output_units):
+        self.linear1 = Linear(input_units, hidden_units)
+        self.activation = ReLU()
+        self.linear2 = Linear(hidden_units, output_units)
+
+    def forward(self, inputs):
+        x = self.linear1.forward(inputs)
+        x = self.activation.forward(x)
+        x = self.linear2.forward(x)
+        return x
+
+
+class TransformerBlock:
+    def __init__(self, d_model, n_heads, ln_pos="post", res_weight_init_scale=1):
+        self.ln_pos = ln_pos
+        self.multi_head_attention = MultiHeadAttention(d_model, d_model, n_heads)
+        self.layernorm1 = LayerNormalization(d_model)
+
+        self.ffn = FeedForwardNetwork(d_model, 4 * d_model, d_model)
+        self.layernorm2 = LayerNormalization(d_model)
+
+    def forward(self, inputs, mask_attention=None, padding_mask=None):
+        if self.ln_pos == "post":
+            out = inputs + self.multi_head_attention.forward(
+                inputs, mask=mask_attention
+            )
+            out = self.layernorm1.forward(out)
+            out = out + self.ffn.forward(out)
+            out = self.layernorm2.forward(out)
+
+        elif self.ln_pos == "pre":
+            out = inputs + self.multi_head_attention.forward(
+                self.layernorm1.forward(inputs), mask=mask_attention
+            )
+            out = out + self.ffn.forward(self.layernorm2.forward(out))
+
+        return out
