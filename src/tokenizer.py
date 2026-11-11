@@ -12,9 +12,12 @@ from typing import BinaryIO
 
 from tqdm import tqdm
 
+
 # GPT-2 pre-tokenization pattern. The `regex` package is required because
 # this pattern uses Unicode character properties such as \p{L} and \p{N}.
-GPT2_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+(?!\S)|\s+"""
+GPT2_PATTERN = (
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+(?!\S)|\s+"""
+)
 
 
 def count_pre_tokenize(
@@ -34,9 +37,9 @@ def count_pre_tokenize(
 
     # Special tokens must be isolated before ordinary text is pre-tokenized.
     if special_tokens:
-        special_pattern = (
-            "(" + "|".join(re.escape(token) for token in special_tokens) + ")"
-        )
+        special_pattern = "(" + "|".join(
+            re.escape(token) for token in special_tokens
+        ) + ")"
         split_special_tokens = re.split(special_pattern, chunk)
     else:
         split_special_tokens = [chunk]
@@ -90,9 +93,9 @@ def find_chunk_boundaries(
     an arbitrary byte offset. Fewer chunks may be returned if boundaries
     overlap or the special token does not occur often enough.
     """
-    assert isinstance(
-        split_special_token, bytes
-    ), "Must represent special token as a bytestring"
+    assert isinstance(split_special_token, bytes), (
+        "Must represent special token as a bytestring"
+    )
     if desired_num_chunks < 1:
         raise ValueError("desired_num_chunks must be at least 1")
 
@@ -106,7 +109,9 @@ def find_chunk_boundaries(
     chunk_size = max(1, file_size // desired_num_chunks)
 
     # Initial guesses for chunk boundary locations, uniformly spaced.
-    chunk_boundaries = [index * chunk_size for index in range(desired_num_chunks + 1)]
+    chunk_boundaries = [
+        index * chunk_size for index in range(desired_num_chunks + 1)
+    ]
     chunk_boundaries[-1] = file_size
 
     mini_chunk_size = 4096
@@ -276,7 +281,9 @@ def train_bpe_tokenizer(
 
             # Add the new sequence's contribution to pair counts.
             for pair in get_all_pairs(new_pre_token):
-                pair_counts[pair] = pair_counts.get(pair, 0) + old_pre_token_frequency
+                pair_counts[pair] = (
+                    pair_counts.get(pair, 0) + old_pre_token_frequency
+                )
                 pair_to_pre_token.setdefault(pair, set()).add(new_pre_token)
 
         pair_to_pre_token.pop(max_pair, None)
@@ -315,7 +322,9 @@ class Tokenizer:
             (bytes(token1), bytes(token2)) for token1, token2 in bpe_merges
         ]
         self.bpe_merges = {
-            (self.i_vocab[token1], self.i_vocab[token2]): self.i_vocab[token1 + token2]
+            (self.i_vocab[token1], self.i_vocab[token2]): self.i_vocab[
+                token1 + token2
+            ]
             for token1, token2 in self.raw_bpe_merges
         }
         self.bpe_merges_ranks = {
@@ -346,9 +355,9 @@ class Tokenizer:
     def encode(self, text: str) -> list[int]:
         """Encode text into BPE token IDs."""
         if self.special_tokens:
-            special_pattern = (
-                "(" + "|".join(re.escape(token) for token in self.special_tokens) + ")"
-            )
+            special_pattern = "(" + "|".join(
+                re.escape(token) for token in self.special_tokens
+            ) + ")"
             splits = re.split(special_pattern, text)
         else:
             splits = [text]
@@ -423,11 +432,15 @@ class Tokenizer:
                     buffer.append(token_id)
 
                     if len(buffer) >= 10_000:
-                        output_file.write(np.asarray(buffer, dtype=np.uint16).tobytes())
+                        output_file.write(
+                            np.asarray(buffer, dtype=np.uint16).tobytes()
+                        )
                         buffer = []
 
                 if buffer:
-                    output_file.write(np.asarray(buffer, dtype=np.uint16).tobytes())
+                    output_file.write(
+                        np.asarray(buffer, dtype=np.uint16).tobytes()
+                    )
 
     def decode(self, ids: list[int]) -> str:
         """Decode token IDs back into text."""
@@ -443,7 +456,8 @@ class Tokenizer:
         """Export vocabulary and merges as JSON files."""
         vocab_export = {key: list(value) for key, value in self.vocab.items()}
         merges_export = [
-            (list(token1), list(token2)) for token1, token2 in self.raw_bpe_merges
+            (list(token1), list(token2))
+            for token1, token2 in self.raw_bpe_merges
         ]
 
         os.makedirs(os.path.dirname(vocab_path) or ".", exist_ok=True)
@@ -521,32 +535,173 @@ class Tokenizer:
         return cls(vocab, merges, special_tokens, verbose)
 
 
-from pathlib import Path
+def _read_int(prompt: str, default: int | None = None) -> int:
+    """Read an integer from the terminal, optionally using a default value."""
+    while True:
+        value = input(prompt).strip()
+        if not value and default is not None:
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            print("Please enter a valid integer.")
+
+
+def _read_special_tokens() -> list[str]:
+    """Read comma-separated special tokens from the terminal."""
+    value = input("Special tokens (comma-separated, default: <|endoftext|>): ").strip()
+    if not value:
+        return ["<|endoftext|>"]
+    return [token.strip() for token in value.split(",") if token.strip()]
+
+
+def run_menu() -> None:
+    """Run the interactive tokenizer menu until the user chooses Exit."""
+    tokenizer: Tokenizer | None = None
+
+    while True:
+        print("\n" + "=" * 42)
+        print("          BYTE-LEVEL BPE TOKENIZER")
+        print("=" * 42)
+        print("1. Train a new tokenizer")
+        print("2. Load a tokenizer from files")
+        print("3. Encode text")
+        print("4. Decode token IDs")
+        print("5. Encode a large text file")
+        print("6. Export current tokenizer")
+        print("0. Exit")
+        print("-" * 42)
+        print("Status:", "Tokenizer loaded" if tokenizer else "No tokenizer loaded")
+
+        choice = input("Choose an option: ").strip()
+
+        try:
+            if choice == "1":
+                input_path = input("Training text file path: ").strip()
+                if not os.path.isfile(input_path):
+                    print("File not found:", input_path)
+                    continue
+
+                vocab_size = _read_int("Vocabulary size [10000]: ", 10_000)
+                num_processes = _read_int("Number of processes [1]: ", 1)
+                special_tokens = _read_special_tokens()
+
+                print("\nTraining tokenizer...")
+                tokenizer = Tokenizer.train(
+                    input_path=input_path,
+                    vocab_size=vocab_size,
+                    special_tokens=special_tokens,
+                    num_processes=num_processes,
+                    verbose=True,
+                )
+                print("Tokenizer training completed.")
+
+                export_now = input("Export tokenizer now? [Y/n]: ").strip().lower()
+                if export_now in ("", "y", "yes"):
+                    vocab_path = input(
+                        "Vocabulary output path [./models/tokenizers/vocab.json]: "
+                    ).strip() or "./models/tokenizers/vocab.json"
+                    merges_path = input(
+                        "Merges output path [./models/tokenizers/merges.json]: "
+                    ).strip() or "./models/tokenizers/merges.json"
+                    tokenizer.export_to_files(
+                        vocab_path=vocab_path,
+                        merges_path=merges_path,
+                        user_friendly=True,
+                    )
+
+            elif choice == "2":
+                vocab_path = input("Vocabulary JSON path: ").strip()
+                merges_path = input("Merges JSON path: ").strip()
+                if not os.path.isfile(vocab_path) or not os.path.isfile(merges_path):
+                    print("Could not find the vocabulary or merges file.")
+                    continue
+
+                special_tokens = _read_special_tokens()
+                tokenizer = Tokenizer.from_files(
+                    vocab_path=vocab_path,
+                    merges_path=merges_path,
+                    special_tokens=special_tokens,
+                    verbose=True,
+                )
+                print("Tokenizer loaded successfully.")
+
+            elif choice == "3":
+                if tokenizer is None:
+                    print("Train or load a tokenizer first.")
+                    continue
+
+                text = input("Text to encode: ")
+                token_ids = tokenizer.encode(text)
+                print("\nToken IDs:")
+                print(token_ids)
+                print("Number of tokens:", len(token_ids))
+
+            elif choice == "4":
+                if tokenizer is None:
+                    print("Train or load a tokenizer first.")
+                    continue
+
+                raw_ids = input("Token IDs (separated by spaces or commas): ").strip()
+                try:
+                    token_ids = [
+                        int(value)
+                        for value in raw_ids.replace(",", " ").split()
+                    ]
+                    print("\nDecoded text:")
+                    print(tokenizer.decode(token_ids))
+                except ValueError:
+                    print("Invalid token IDs. Enter integers separated by spaces or commas.")
+                except KeyError as error:
+                    print(f"Unknown token ID: {error}")
+
+            elif choice == "5":
+                if tokenizer is None:
+                    print("Train or load a tokenizer first.")
+                    continue
+
+                input_path = input("Input text file path: ").strip()
+                if not os.path.isfile(input_path):
+                    print("File not found:", input_path)
+                    continue
+                output_path = input("Output token file path: ").strip()
+                if not output_path:
+                    print("Output path cannot be empty.")
+                    continue
+
+                tokenizer.encode_large_file(input_path, output_path)
+                print("Encoded token IDs written to:", output_path)
+                print("Note: the output is a binary uint16 file.")
+
+            elif choice == "6":
+                if tokenizer is None:
+                    print("Train or load a tokenizer first.")
+                    continue
+
+                vocab_path = input("Vocabulary output path: ").strip()
+                merges_path = input("Merges output path: ").strip()
+                if not vocab_path or not merges_path:
+                    print("Both output paths are required.")
+                    continue
+
+                tokenizer.export_to_files(
+                    vocab_path=vocab_path,
+                    merges_path=merges_path,
+                    user_friendly=True,
+                )
+
+            elif choice == "0":
+                print("Exiting tokenizer. Goodbye!")
+                break
+
+            else:
+                print("Invalid option. Choose one of the listed options.")
+
+        except (ValueError, OSError, RuntimeError) as error:
+            print(f"\nOperation failed: {error}")
+        except KeyboardInterrupt:
+            print("\nOperation cancelled. Returning to the menu...")
+
 
 if __name__ == "__main__":
-    # Train a BPE tokenizer with a vocabulary size of 10,000.
-    tokenizer = Tokenizer.train(
-        "./data/shakespeare/shakespeare_all.txt",
-        vocab_size=10_000,
-        special_tokens=["<|endoftext|>"],
-        num_processes=1,
-        verbose=True,
-    )
-
-    # Test the tokenizer on a short sample.
-    with open("./data/shakespeare/TinyShakespeare.txt", "r", encoding="utf-8") as file:
-        text = file.read()
-
-    print("Testing tokenizer!")
-    print("Input Sentence:")
-    print(text[:100])
-    print("Tokenized Sentence:")
-    print(tokenizer.encode(text[:100]))
-    print("Decoded Sentence:")
-    print(tokenizer.decode(tokenizer.encode(text[:100])))
-
-    tokenizer.export_to_files(
-        vocab_path="./models/tokenizers/shakespeare10k_vocab.json",
-        merges_path="./models/tokenizers/shakespeare10k_merges.json",
-        user_friendly=False,
-    )
+    run_menu()

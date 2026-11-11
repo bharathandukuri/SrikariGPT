@@ -1,17 +1,21 @@
 import numpy as np
-
-from tokenizer import BPETokenizerSimple, VOCAB_PATH, MERGES_PATH
+from tokenizer import Tokenizer
 from gpt import GPT
 
 TRANSFORMER_BLOCKS = 4
 EMBEDDING_DIMENSIONS = 256
 ATTENTION_HEADS = 4
 LAYERNORM_POS = "pre"
+VOCAB_PATH = ".\\models\\tokenizers\\shakespeare_all_10k_vocab.json"
+MERGES_PATH = ".\\models\\tokenizers\\shakespeare_all_10k_merges.json"
 
 
 # 1. Load tokenizer
-tokenizer = BPETokenizerSimple()
-tokenizer.load_vocab_and_merges(VOCAB_PATH, MERGES_PATH)
+tokenizer = Tokenizer.from_files(
+    vocab_path=VOCAB_PATH,
+    merges_path=MERGES_PATH,
+    special_tokens=["<|endoftext|>"],
+)
 
 VOCAB_SIZE = len(tokenizer.vocab)
 
@@ -26,32 +30,11 @@ gpt = GPT(
 )
 
 
-# 3. Tokenize prompt
+from generation import generate
+
 prompt = "Thou art a very earth. Villain, "
+print("Input prompt: ", prompt)
+output = generate(model=gpt, tokenizer=tokenizer, prompt=prompt, max_new_tokens=30)
 
-tokens = np.array([tokenizer.encode(prompt)], dtype=np.int64)
-
-
-# 4. Create causal mask
-B, T = tokens.shape
-
-mask = np.triu(np.full((T, T), -np.inf), k=1)
-
-mask = mask[np.newaxis, np.newaxis, :, :]
-
-
-# 5. Forward pass
-logits = gpt.forward(tokens, mask_attention=mask)
-
-
-# 6. Inspect output
-print("Input shape:", tokens.shape)
-print("Logits shape:", logits.shape)
-
-# Get predictions for the final position
-next_token_logits = logits[:, -1, :]
-
-next_token = np.argmax(next_token_logits, axis=-1)
-
-print("Next token ID:", next_token[0])
-print("Predicted token:", tokenizer.decode(next_token.tolist()))
+print("\nGenerated text:")
+print(output)
