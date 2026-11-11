@@ -35,7 +35,7 @@ class PositionalEncodings:
 
         positional_encodings = pe_sin + pe_cos
 
-        return inputs + positional_endcodings[np.newaxis, ...]
+        return inputs + positional_encodings[np.newaxis, ...]
 
 
 class Softmax:

@@ -1,410 +1,552 @@
-from collections import Counter, deque
-from functools import lru_cache
+"""A GPT-2-style byte-pair encoding (BPE) tokenizer trained from scratch."""
+
+import gc
 import json
 import os
+import regex as re
+import numpy as np
+
+from collections import defaultdict
+from multiprocessing import Process, Queue
+from typing import BinaryIO
+
+from tqdm import tqdm
+
+# GPT-2 pre-tokenization pattern. The `regex` package is required because
+# this pattern uses Unicode character properties such as \p{L} and \p{N}.
+GPT2_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+(?!\S)|\s+"""
 
 
-# https://sebastianraschka.com/blog/2025/bpe-from-scratch.html
-# This is exact implimentation of sebstianraschka.
-# Only the train method has been changed to include progress of training of the tokenizer
-class BPETokenizerSimple:
-    def __init__(self):
-        # Maps token_id to token_str (e.g., {11246: "some"})
-        self.vocab = {}
-        # Maps token_str to token_id (e.g., {"some": 11246})
-        self.inverse_vocab = {}
-        # Dictionary of BPE merges: {(token_id1, token_id2): merged_token_id}
-        self.bpe_merges = {}
+def count_pre_tokenize(
+    file_path: str,
+    start: int,
+    end: int,
+    compiled_regex,
+    special_tokens: list[str],
+    q: Queue,
+) -> None:
+    """Count pre-token frequencies in one independently processable file chunk."""
+    process_dict: dict[str, int] = {}
 
-        # For the official OpenAI GPT-2 merges, use a rank dict:
-        #  of form {(string_A, string_B): rank}, where lower rank = higher priority
-        self.bpe_ranks = {}
+    with open(file_path, "rb") as file:
+        file.seek(start)
+        chunk = file.read(end - start).decode("utf-8", errors="ignore")
 
-    # Train the BPE tokenizer from scratch.
-    def train(self, text, vocab_size, allowed_special={"<|endoftext|>"}):
-        # Preprocess: Replace spaces with "Ġ"
-        # Note that Ġ is a particularity of the GPT-2 BPE implementation
-        # E.g., "Hello world" might be tokenized as ["Hello", "Ġworld"]
-        # (GPT-4 BPE would tokenize it as ["Hello", " world"])
-        processed_text = []
-        for i, char in enumerate(text):
-            if char == " " and i != 0:
-                processed_text.append("Ġ")
-            if char != " ":
-                processed_text.append(char)
-        processed_text = "".join(processed_text)
-
-        # Initialize vocab with unique characters, including "Ġ" if present
-        # Start with the first 256 ASCII characters
-        unique_chars = [chr(i) for i in range(256)]
-        unique_chars.extend(
-            char for char in sorted(set(processed_text)) if char not in unique_chars
+    # Special tokens must be isolated before ordinary text is pre-tokenized.
+    if special_tokens:
+        special_pattern = (
+            "(" + "|".join(re.escape(token) for token in special_tokens) + ")"
         )
-        if "Ġ" not in unique_chars:
-            unique_chars.append("Ġ")
+        split_special_tokens = re.split(special_pattern, chunk)
+    else:
+        split_special_tokens = [chunk]
 
-        self.vocab = {i: char for i, char in enumerate(unique_chars)}
-        self.inverse_vocab = {char: i for i, char in self.vocab.items()}
+    del chunk
+    gc.collect()
 
-        # Add allowed special tokens
-        if allowed_special:
-            for token in allowed_special:
-                if token not in self.inverse_vocab:
-                    new_id = len(self.vocab)
-                    self.vocab[new_id] = token
-                    self.inverse_vocab[token] = new_id
+    for split in split_special_tokens:
+        # Do not include special tokens in the ordinary pre-token counts.
+        if split in special_tokens:
+            continue
 
-        # Tokenize the processed_text into token IDs
-        token_ids = [self.inverse_vocab[char] for char in processed_text]
+        for match in compiled_regex.finditer(split):
+            pre_token = match.group()
+            process_dict[pre_token] = process_dict.get(pre_token, 0) + 1
 
-        # BPE steps 1-3: Repeatedly find and replace frequent pairs
-        total_merges = max(0, vocab_size - len(self.vocab))
+    del split_special_tokens
+    gc.collect()
 
-        for step, new_id in enumerate(range(len(self.vocab), vocab_size), start=1):
-            pair_id = self.find_freq_pair(token_ids, mode="most")
+    process_dict_binary = {
+        tuple(pre_token.encode("utf-8")): frequency
+        for pre_token, frequency in process_dict.items()
+    }
+    q.put(process_dict_binary)
 
-            if pair_id is None:
+
+def merge_dictionaries(dict_list: list[dict]) -> dict:
+    """Merge frequency dictionaries produced by the worker processes."""
+    merged = defaultdict(int)
+
+    for dictionary in dict_list:
+        for key, value in dictionary.items():
+            merged[key] += value
+
+    return dict(merged)
+
+
+def get_all_pairs(token_tuple: tuple) -> list[tuple]:
+    """Return every adjacent pair in a token sequence."""
+    return list(zip(token_tuple[:-1], token_tuple[1:]))
+
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """Find byte offsets that split a file at occurrences of a special token.
+
+    Chunks can then be counted independently without splitting a document at
+    an arbitrary byte offset. Fewer chunks may be returned if boundaries
+    overlap or the special token does not occur often enough.
+    """
+    assert isinstance(
+        split_special_token, bytes
+    ), "Must represent special token as a bytestring"
+    if desired_num_chunks < 1:
+        raise ValueError("desired_num_chunks must be at least 1")
+
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    if file_size == 0:
+        return [0]
+
+    chunk_size = max(1, file_size // desired_num_chunks)
+
+    # Initial guesses for chunk boundary locations, uniformly spaced.
+    chunk_boundaries = [index * chunk_size for index in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096
+
+    for boundary_index in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[boundary_index]
+        file.seek(initial_position)
+
+        while True:
+            mini_chunk = file.read(mini_chunk_size)
+
+            if mini_chunk == b"":
+                chunk_boundaries[boundary_index] = file_size
                 break
 
-            token_ids = self.replace_pair(token_ids, pair_id, new_id)
-            self.bpe_merges[pair_id] = new_id
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[boundary_index] = initial_position + found_at
+                break
 
-            # Display progress
-            percentage = (step / total_merges) * 100
+            initial_position += len(mini_chunk)
 
-            print(
-                f"\rTraining BPE: {step}/{total_merges} " f"[{percentage:.2f}%]",
-                end="",
-                flush=True,
+    # Boundaries must be unique and in ascending order.
+    return sorted(set(chunk_boundaries))
+
+
+def find_max(pair_counts: dict, vocab: dict[int, bytes]) -> tuple:
+    """Find the most frequent pair, using token bytes to break ties."""
+    max_freq = -1
+    max_pair = (-1, -1)
+
+    for pair, frequency in pair_counts.items():
+        if frequency > max_freq:
+            max_freq = frequency
+            max_pair = pair
+        elif frequency == max_freq:
+            if vocab[pair[0]] > vocab[max_pair[0]]:
+                max_pair = pair
+            elif vocab[pair[0]] == vocab[max_pair[0]]:
+                if vocab[pair[1]] > vocab[max_pair[1]]:
+                    max_pair = pair
+
+    return max_pair
+
+
+def train_bpe_tokenizer(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str],
+    num_processes: int = 1,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Train a byte-level BPE vocabulary and return it with its merge list."""
+    if vocab_size < 256 + len(special_tokens):
+        raise ValueError("vocab_size must fit all 256 byte tokens and special tokens")
+    if num_processes < 1:
+        raise ValueError("num_processes must be at least 1")
+
+    compiled_regex = re.compile(GPT2_PATTERN)
+
+    # Parallel pre-tokenization.
+    processes = []
+    dictionaries = Queue()
+    dictionaries_list = []
+
+    with open(input_path, "rb") as file:
+        # This token marks document boundaries in the training corpus.
+        split_token = b"<|endoftext|>"
+        boundaries = find_chunk_boundaries(file, num_processes, split_token)
+
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        process = Process(
+            target=count_pre_tokenize,
+            args=(
+                input_path,
+                start,
+                end,
+                compiled_regex,
+                special_tokens,
+                dictionaries,
+            ),
+        )
+        process.start()
+        processes.append(process)
+
+    # Read exactly one result for each process actually started. The number
+    # of usable chunks can be smaller than num_processes.
+    for _ in processes:
+        dictionaries_list.append(dictionaries.get())
+
+    for process in processes:
+        process.join()
+        if process.exitcode != 0:
+            raise RuntimeError(
+                f"Pre-tokenization worker exited with code {process.exitcode}"
             )
 
-        print("\nBPE training completed!")
+    dictionaries.close()
+    dictionaries.join_thread()
+    gc.collect()
 
-        # Build the vocabulary with merged tokens
-        for (p0, p1), new_id in self.bpe_merges.items():
-            merged_token = self.vocab[p0] + self.vocab[p1]
-            self.vocab[new_id] = merged_token
-            self.inverse_vocab[merged_token] = new_id
+    # Merge the dictionaries from all worker processes.
+    pre_tokens = merge_dictionaries(dictionaries_list)
+    pair_counts: dict[tuple, int] = {}
+    pair_to_pre_token: dict[tuple, set[tuple]] = {}
 
-    # Encode the input text into a list of token IDs, with tiktoken-style handling of special tokens.
-    def encode(self, text, allowed_special=None):
-        import re
+    # Count adjacent-pair frequencies in the initial pre-token sequences.
+    for pre_token, count in pre_tokens.items():
+        for pair in get_all_pairs(pre_token):
+            pair_counts[pair] = pair_counts.get(pair, 0) + count
+            pair_to_pre_token.setdefault(pair, set()).add(pre_token)
 
-        token_ids = []
+    # The initial vocabulary contains all 256 possible byte values.
+    vocab: dict[int, bytes] = {index: bytes([index]) for index in range(256)}
 
-        # If special token handling is enabled
-        if allowed_special is not None and len(allowed_special) > 0:
-            # Build regex to match allowed special tokens
-            special_pattern = (
-                "("
-                + "|".join(
-                    re.escape(tok)
-                    for tok in sorted(allowed_special, key=len, reverse=True)
-                )
-                + ")"
-            )
+    # Add special tokens to the vocabulary. They are never BPE-merged.
+    for token in special_tokens:
+        vocab[len(vocab)] = token.encode("utf-8")
 
-            last_index = 0
-            for match in re.finditer(special_pattern, text):
-                prefix = text[last_index : match.start()]
-                token_ids.extend(
-                    self.encode(prefix, allowed_special=None)
-                )  # Encode prefix without special handling
+    print("Starting BPE merges!")
+    merges: list[tuple[bytes, bytes]] = []
 
-                special_token = match.group(0)
-                if special_token in self.inverse_vocab:
-                    token_ids.append(self.inverse_vocab[special_token])
+    for _ in tqdm(range(vocab_size - len(vocab))):
+        if not pair_counts:
+            break
+
+        max_pair = find_max(pair_counts, vocab)
+        if max_pair == (-1, -1):
+            break
+
+        token_bytes1 = vocab[max_pair[0]]
+        token_bytes2 = vocab[max_pair[1]]
+        merges.append((token_bytes1, token_bytes2))
+
+        new_token_id = len(vocab)
+        vocab[new_token_id] = token_bytes1 + token_bytes2
+
+        # Only pre-token sequences containing the selected pair need updating.
+        for old_pre_token in list(pair_to_pre_token.get(max_pair, set())):
+            old_pre_token_frequency = pre_tokens[old_pre_token]
+            new_pre_token = []
+
+            # Remove the old sequence's contribution from pair counts.
+            for pair in get_all_pairs(old_pre_token):
+                pair_counts[pair] -= old_pre_token_frequency
+
+                if pair != max_pair:
+                    pair_to_pre_token[pair].discard(old_pre_token)
+                    if not pair_to_pre_token[pair]:
+                        del pair_to_pre_token[pair]
+
+            # Replace every non-overlapping occurrence of max_pair.
+            index = 0
+            while index < len(old_pre_token):
+                if index == len(old_pre_token) - 1:
+                    new_pre_token.append(old_pre_token[index])
+                    index += 1
+                elif (old_pre_token[index], old_pre_token[index + 1]) == max_pair:
+                    new_pre_token.append(new_token_id)
+                    index += 2
                 else:
-                    raise ValueError(
-                        f"Special token {special_token} not found in vocabulary."
-                    )
-                last_index = match.end()
+                    new_pre_token.append(old_pre_token[index])
+                    index += 1
 
-            text = text[last_index:]  # Remaining part to process normally
+            new_pre_token = tuple(new_pre_token)
+            pre_tokens[new_pre_token] = old_pre_token_frequency
+            del pre_tokens[old_pre_token]
 
-            # Check if any disallowed special tokens are in the remainder
-            disallowed = [
-                tok
-                for tok in self.inverse_vocab
-                if tok.startswith("<|")
-                and tok.endswith("|>")
-                and tok in text
-                and tok not in allowed_special
-            ]
-            if disallowed:
-                raise ValueError(
-                    f"Disallowed special tokens encountered in text: {disallowed}"
-                )
+            # Add the new sequence's contribution to pair counts.
+            for pair in get_all_pairs(new_pre_token):
+                pair_counts[pair] = pair_counts.get(pair, 0) + old_pre_token_frequency
+                pair_to_pre_token.setdefault(pair, set()).add(new_pre_token)
 
-        # If no special tokens, or remaining text after special token split:
-        tokens = []
-        lines = text.split("\n")
-        for i, line in enumerate(lines):
-            if i > 0:
-                tokens.append("\n")
-            words = line.split()
-            for j, word in enumerate(words):
-                if j == 0 and i > 0:
-                    tokens.append("Ġ" + word)
-                elif j == 0:
-                    tokens.append(word)
-                else:
-                    tokens.append("Ġ" + word)
+        pair_to_pre_token.pop(max_pair, None)
+        pair_counts.pop(max_pair, None)
 
-        for token in tokens:
-            if token in self.inverse_vocab:
-                token_ids.append(self.inverse_vocab[token])
-            else:
-                token_ids.extend(self.tokenize_with_bpe(token))
+    return vocab, merges
 
+
+class Tokenizer:
+    """Byte-level BPE tokenizer with GPT-2-style pre-tokenization."""
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes | list[int]],
+        bpe_merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+        verbose: bool = False,
+    ):
+        if verbose:
+            print("Initializing Tokenizer!")
+
+        self.verbose = verbose
+        self.vocab = {
+            key: value if isinstance(value, bytes) else bytes(value)
+            for key, value in vocab.items()
+        }
+        self.i_vocab = {value: key for key, value in self.vocab.items()}
+        self.special_tokens = (
+            []
+            if special_tokens is None
+            else sorted(set(special_tokens), key=len, reverse=True)
+        )
+        self.PAT = GPT2_PATTERN
+
+        self.raw_bpe_merges = [
+            (bytes(token1), bytes(token2)) for token1, token2 in bpe_merges
+        ]
+        self.bpe_merges = {
+            (self.i_vocab[token1], self.i_vocab[token2]): self.i_vocab[token1 + token2]
+            for token1, token2 in self.raw_bpe_merges
+        }
+        self.bpe_merges_ranks = {
+            (self.i_vocab[token1], self.i_vocab[token2]): rank
+            for rank, (token1, token2) in enumerate(self.raw_bpe_merges)
+        }
+
+        self.b_int_to_token = {
+            index: self.i_vocab[bytes([index])] for index in range(256)
+        }
+        self.pre_token_cache: dict[tuple, tuple] = {}
+        self.pre_token_utf8_cache: dict[str, tuple] = {}
+
+    def _to_utf8(self, pre_token: str) -> tuple[int, ...]:
+        """Convert a pre-token's UTF-8 bytes into initial vocabulary IDs."""
+        if pre_token in self.special_tokens:
+            return (self.i_vocab[pre_token.encode("utf-8")],)
+
+        if pre_token in self.pre_token_utf8_cache:
+            return self.pre_token_utf8_cache[pre_token]
+
+        token_ids = tuple(
+            self.b_int_to_token[byte] for byte in pre_token.encode("utf-8")
+        )
+        self.pre_token_utf8_cache[pre_token] = token_ids
         return token_ids
 
-    # Tokenize a single token using BPE merges.
-    def tokenize_with_bpe(self, token):
-        # Tokenize the token into individual characters (as initial token IDs)
-        token_ids = [self.inverse_vocab.get(char, None) for char in token]
-        if None in token_ids:
-            missing_chars = [char for char, tid in zip(token, token_ids) if tid is None]
-            raise ValueError(f"Characters not found in vocab: {missing_chars}")
-
-        # If we haven't loaded OpenAI's GPT-2 merges, use my approach
-        if not self.bpe_ranks:
-            can_merge = True
-            while can_merge and len(token_ids) > 1:
-                can_merge = False
-                new_tokens = []
-                i = 0
-                while i < len(token_ids) - 1:
-                    pair = (token_ids[i], token_ids[i + 1])
-                    if pair in self.bpe_merges:
-                        merged_token_id = self.bpe_merges[pair]
-                        new_tokens.append(merged_token_id)
-                        # Uncomment for educational purposes:
-                        # print(f"Merged pair {pair} -> {merged_token_id} ('{self.vocab[merged_token_id]}')")
-                        i += 2  # Skip the next token as it's merged
-                        can_merge = True
-                    else:
-                        new_tokens.append(token_ids[i])
-                        i += 1
-                if i < len(token_ids):
-                    new_tokens.append(token_ids[i])
-                token_ids = new_tokens
-            return token_ids
-
-        # Otherwise, do GPT-2-style merging with the ranks:
-        # 1) Convert token_ids back to string "symbols" for each ID
-        symbols = [self.vocab[id_num] for id_num in token_ids]
-
-        # Repeatedly merge all occurrences of the lowest-rank pair
-        while True:
-            # Collect all adjacent pairs
-            pairs = set(zip(symbols, symbols[1:]))
-            if not pairs:
-                break
-
-            # Find the pair with the best (lowest) rank
-            min_rank = float("inf")
-            bigram = None
-            for p in pairs:
-                r = self.bpe_ranks.get(p, float("inf"))
-                if r < min_rank:
-                    min_rank = r
-                    bigram = p
-
-            # If no valid ranked pair is present, we're done
-            if bigram is None or bigram not in self.bpe_ranks:
-                break
-
-            # Merge all occurrences of that pair
-            first, second = bigram
-            new_symbols = []
-            i = 0
-            while i < len(symbols):
-                # If we see (first, second) at position i, merge them
-                if (
-                    i < len(symbols) - 1
-                    and symbols[i] == first
-                    and symbols[i + 1] == second
-                ):
-                    new_symbols.append(first + second)  # merged symbol
-                    i += 2
-                else:
-                    new_symbols.append(symbols[i])
-                    i += 1
-            symbols = new_symbols
-
-            if len(symbols) == 1:
-                break
-
-        # Finally, convert merged symbols back to IDs
-        merged_ids = [self.inverse_vocab[sym] for sym in symbols]
-        return merged_ids
-
-    # Decode a list of token IDs back into a string.
-    def decode(self, token_ids):
-        decoded_string = ""
-        for i, token_id in enumerate(token_ids):
-            if token_id not in self.vocab:
-                raise ValueError(f"Token ID {token_id} not found in vocab.")
-            token = self.vocab[token_id]
-            if token == "\n":
-                if decoded_string and not decoded_string.endswith(" "):
-                    decoded_string += " "  # Add space if not present before a newline
-                decoded_string += token
-            elif token.startswith("Ġ"):
-                decoded_string += " " + token[1:]
-            else:
-                decoded_string += token
-        return decoded_string
-
-    # Save the vocabulary and BPE merges to JSON files.
-    def save_vocab_and_merges(self, vocab_path, bpe_merges_path):
-        # Save vocabulary
-        with open(vocab_path, "w", encoding="utf-8") as file:
-            json.dump(self.vocab, file, ensure_ascii=False, indent=2)
-
-        # Save BPE merges as a list of dictionaries
-        with open(bpe_merges_path, "w", encoding="utf-8") as file:
-            merges_list = [
-                {"pair": list(pair), "new_id": new_id}
-                for pair, new_id in self.bpe_merges.items()
-            ]
-            json.dump(merges_list, file, ensure_ascii=False, indent=2)
-
-    # Load the vocabulary and BPE merges from JSON files.
-    def load_vocab_and_merges(self, vocab_path, bpe_merges_path):
-        # Load vocabulary
-        with open(vocab_path, "r", encoding="utf-8") as file:
-            loaded_vocab = json.load(file)
-            self.vocab = {int(k): v for k, v in loaded_vocab.items()}
-            self.inverse_vocab = {v: int(k) for k, v in loaded_vocab.items()}
-
-        # Load BPE merges
-        with open(bpe_merges_path, "r", encoding="utf-8") as file:
-            merges_list = json.load(file)
-            for merge in merges_list:
-                pair = tuple(merge["pair"])
-                new_id = merge["new_id"]
-                self.bpe_merges[pair] = new_id
-
-    @lru_cache(maxsize=None)
-    def get_special_token_id(self, token):
-        return self.inverse_vocab.get(token, None)
-
-    @staticmethod
-    def find_freq_pair(token_ids, mode="most"):
-        pairs = Counter(zip(token_ids, token_ids[1:]))
-
-        if not pairs:
-            return None
-
-        if mode == "most":
-            return max(pairs.items(), key=lambda x: x[1])[0]
-        elif mode == "least":
-            return min(pairs.items(), key=lambda x: x[1])[0]
+    def encode(self, text: str) -> list[int]:
+        """Encode text into BPE token IDs."""
+        if self.special_tokens:
+            special_pattern = (
+                "(" + "|".join(re.escape(token) for token in self.special_tokens) + ")"
+            )
+            splits = re.split(special_pattern, text)
         else:
-            raise ValueError("Invalid mode. Choose 'most' or 'least'.")
+            splits = [text]
 
-    @staticmethod
-    def replace_pair(token_ids, pair_id, new_id):
-        dq = deque(token_ids)
-        replaced = []
-
-        while dq:
-            current = dq.popleft()
-            if dq and (current, dq[0]) == pair_id:
-                replaced.append(new_id)
-                # Remove the 2nd token of the pair, 1st was already removed
-                dq.popleft()
+        pre_tokens = []
+        for split in splits:
+            if split in self.special_tokens:
+                pre_tokens.append(split)
             else:
-                replaced.append(current)
+                pre_tokens.extend(re.findall(self.PAT, split))
 
-        return replaced
+        output_tokens = []
+
+        for pre_token in pre_tokens:
+            tokens = self._to_utf8(pre_token)
+
+            if tokens in self.pre_token_cache:
+                output_tokens.extend(self.pre_token_cache[tokens])
+                continue
+
+            old_tokens = list(tokens)
+
+            while len(old_tokens) > 1:
+                # Find the adjacent pair with the earliest learned merge rank.
+                max_rank = float("inf")
+                max_pair = None
+
+                for pair in get_all_pairs(old_tokens):
+                    rank = self.bpe_merges_ranks.get(pair)
+                    if rank is not None and rank < max_rank:
+                        max_rank = rank
+                        max_pair = pair
+
+                if max_pair is None:
+                    break
+
+                merged_token = self.bpe_merges[max_pair]
+                new_tokens = []
+                index = 0
+
+                while index < len(old_tokens):
+                    if index == len(old_tokens) - 1:
+                        new_tokens.append(old_tokens[index])
+                        index += 1
+                    elif (old_tokens[index], old_tokens[index + 1]) == max_pair:
+                        new_tokens.append(merged_token)
+                        index += 2
+                    else:
+                        new_tokens.append(old_tokens[index])
+                        index += 1
+
+                old_tokens = new_tokens
+
+            self.pre_token_cache[tokens] = tuple(old_tokens)
+            output_tokens.extend(old_tokens)
+
+        return output_tokens
+
+    def encode_iterable(self, iterable):
+        """Yield token IDs for each text block in an iterable."""
+        for block in iterable:
+            yield from self.encode(block)
+
+    def encode_large_file(self, large_file_path: str, output_path: str) -> None:
+        """Encode a large text file and write token IDs as uint16 values."""
+        with open(large_file_path, "r", encoding="utf-8") as input_file:
+            with open(output_path, "wb") as output_file:
+                token_generator = self.encode_iterable(input_file)
+                buffer = []
+
+                for token_id in tqdm(token_generator):
+                    buffer.append(token_id)
+
+                    if len(buffer) >= 10_000:
+                        output_file.write(np.asarray(buffer, dtype=np.uint16).tobytes())
+                        buffer = []
+
+                if buffer:
+                    output_file.write(np.asarray(buffer, dtype=np.uint16).tobytes())
+
+    def decode(self, ids: list[int]) -> str:
+        """Decode token IDs back into text."""
+        byte_string = b"".join(self.vocab[token_id] for token_id in ids)
+        return byte_string.decode(encoding="utf-8", errors="replace")
+
+    def export_to_files(
+        self,
+        vocab_path: str,
+        merges_path: str,
+        user_friendly: bool = False,
+    ) -> None:
+        """Export vocabulary and merges as JSON files."""
+        vocab_export = {key: list(value) for key, value in self.vocab.items()}
+        merges_export = [
+            (list(token1), list(token2)) for token1, token2 in self.raw_bpe_merges
+        ]
+
+        os.makedirs(os.path.dirname(vocab_path) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(merges_path) or ".", exist_ok=True)
+
+        with open(vocab_path, "w", encoding="utf-8") as file:
+            json.dump(vocab_export, file, indent=2)
+
+        with open(merges_path, "w", encoding="utf-8") as file:
+            json.dump(merges_export, file, indent=2)
+
+        print(f"{vocab_path} successfully exported!")
+        print(f"{merges_path} successfully exported!")
+
+        if user_friendly:
+            vocab_friendly_path = vocab_path.removesuffix(".json") + "_friendly.json"
+            merges_friendly_path = merges_path.removesuffix(".json") + "_friendly.json"
+
+            vocab_export_friendly = {
+                key: value.decode("utf-8", errors="replace")
+                for key, value in self.vocab.items()
+            }
+            merges_export_friendly = [
+                (
+                    token1.decode("utf-8", errors="replace"),
+                    token2.decode("utf-8", errors="replace"),
+                )
+                for token1, token2 in self.raw_bpe_merges
+            ]
+
+            with open(vocab_friendly_path, "w", encoding="utf-8") as file:
+                json.dump(vocab_export_friendly, file, indent=2, ensure_ascii=False)
+
+            with open(merges_friendly_path, "w", encoding="utf-8") as file:
+                json.dump(merges_export_friendly, file, indent=2, ensure_ascii=False)
+
+            print(f"{vocab_friendly_path} successfully exported!")
+            print(f"{merges_friendly_path} successfully exported!")
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_path: str,
+        merges_path: str,
+        special_tokens: list[str] | None = None,
+        verbose: bool = False,
+    ) -> "Tokenizer":
+        """Load a tokenizer previously exported with export_to_files()."""
+        with open(vocab_path, "r", encoding="utf-8") as file:
+            vocab_json = json.load(file)
+
+        with open(merges_path, "r", encoding="utf-8") as file:
+            merges_json = json.load(file)
+
+        vocab = {int(key): bytes(value) for key, value in vocab_json.items()}
+        merges = [(bytes(token1), bytes(token2)) for token1, token2 in merges_json]
+
+        return cls(vocab, merges, special_tokens, verbose)
+
+    @classmethod
+    def train(
+        cls,
+        input_path: str,
+        vocab_size: int,
+        special_tokens: list[str],
+        num_processes: int = 1,
+        verbose: bool = False,
+    ) -> "Tokenizer":
+        vocab, merges = train_bpe_tokenizer(
+            input_path=input_path,
+            vocab_size=vocab_size,
+            special_tokens=special_tokens,
+            num_processes=num_processes,
+        )
+        return cls(vocab, merges, special_tokens, verbose)
 
 
 from pathlib import Path
 
-# Tokenizer instance
-tokenizer = BPETokenizerSimple()
+if __name__ == "__main__":
+    # Train a BPE tokenizer with a vocabulary size of 10,000.
+    tokenizer = Tokenizer.train(
+        "./data/shakespeare/shakespeare_all.txt",
+        vocab_size=10_000,
+        special_tokens=["<|endoftext|>"],
+        num_processes=1,
+        verbose=True,
+    )
 
-# Paths
-BASE_PATH = Path(r"C:\Users\Bharath Andukuri\Desktop\Code\SrikariGPT\data\shakespeare")
+    # Test the tokenizer on a short sample.
+    with open("./data/shakespeare/TinyShakespeare.txt", "r", encoding="utf-8") as file:
+        text = file.read()
 
-RAW_DATA = BASE_PATH / "raw_data.txt"
-VOCAB_PATH = BASE_PATH / "vocab.json"
-MERGES_PATH = BASE_PATH / "bpe_merges.json"
+    print("Testing tokenizer!")
+    print("Input Sentence:")
+    print(text[:100])
+    print("Tokenized Sentence:")
+    print(tokenizer.encode(text[:100]))
+    print("Decoded Sentence:")
+    print(tokenizer.decode(tokenizer.encode(text[:100])))
 
-
-def show_menu():
-    print("\n========== Tokenizer ==========")
-    print("1. Train tokenizer")
-    print("2. Load tokenizer")
-    print("3. Save tokenizer")
-    print("4. Encode text")
-    print("5. Decode token IDs")
-    print("6. Show vocabulary information")
-    print("0. Exit")
-    print("==========================================")
-
-
-while True:
-    show_menu()
-
-    choice = input("Enter your choice: ").strip()
-
-    if choice == "1":
-        print("\nLoading training corpus...")
-
-        with open(RAW_DATA, "r", encoding="utf-8") as file:
-            text = file.read()
-
-        vocab_size = int(input("Enter vocabulary size: "))
-
-        print("\nStarting BPE training...\n")
-        tokenizer.train(text, vocab_size)
-
-    elif choice == "2":
-        print("\nLoading tokenizer...")
-
-        tokenizer.load_vocab_and_merges(VOCAB_PATH, MERGES_PATH)
-
-        print("Tokenizer loaded successfully!")
-
-    elif choice == "3":
-        tokenizer.save_vocab_and_merges(VOCAB_PATH, MERGES_PATH)
-
-        print("Tokenizer saved successfully!")
-
-    elif choice == "4":
-        text = input("\nEnter text to encode: ")
-
-        encoded = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
-
-        print("\nEncoded token IDs:")
-        print(encoded)
-
-        print(f"\nToken count: {len(encoded)}")
-
-    elif choice == "5":
-        raw_ids = input("\nEnter token IDs separated by spaces: ")
-
-        token_ids = [int(token.strip()) for token in raw_ids.split()]
-
-        decoded = tokenizer.decode(token_ids)
-
-        print("\nDecoded text:")
-        print(decoded)
-
-    elif choice == "6":
-        print("\n========== Vocabulary Information ==========")
-        print(f"Vocabulary size : {len(tokenizer.vocab)}")
-        print(f"Merge rules     : {len(tokenizer.bpe_merges)}")
-        print(f"Special tokens  : {tokenizer.get_special_token_id('<|endoftext|>')}")
-        print("============================================")
-
-    elif choice == "0":
-        print("\nExiting Tokenizer. Goodbye!")
-        break
-
-    else:
-        print("\nInvalid choice. Please try again.")
+    tokenizer.export_to_files(
+        vocab_path="./models/tokenizers/shakespeare10k_vocab.json",
+        merges_path="./models/tokenizers/shakespeare10k_merges.json",
+        user_friendly=False,
+    )
